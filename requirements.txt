@@ -1,0 +1,13 @@
+pyttsx3
+SpeechRecognition
+pyautogui
+wikipedia
+pywhatkit
+pynput
+bcrypt
+cryptography
+opencv-python
+Pillow
+psutil
+customtkinter
+pystray

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+secure_vault/
+valtrix_config.json
+analytics.json
+*.enc

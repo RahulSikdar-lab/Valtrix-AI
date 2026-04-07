@@ -1,21 +1,10 @@
 import os
 import pyautogui
 import webbrowser
-import pyttsx3
 from time import sleep
 
-# Text-to-speech engine setup
-engine = pyttsx3.init("sapi5")
-voices = engine.getProperty("voices")
-engine.setProperty("voice", voices[1].id)
-engine.setProperty("rate", 170)
-
-def speak(audio):
-    print("Speaking:", audio)
-    engine.say(audio)
-    engine.runAndWait()
-
 openapp = {
+    # --- System Tools ---
     "command prompt": "cmd",
     "powershell": "powershell",
     "task manager": "taskmgr",
@@ -61,7 +50,6 @@ openapp = {
     "privacy settings": "ms-settings:privacy",
     "apps and features": "appwiz.cpl",
     "settings": "ms-settings:",
-
     # --- Microsoft Office ---
     "word": "winword",
     "excel": "excel",
@@ -71,15 +59,12 @@ openapp = {
     "onenote": "onenote",
     "publisher": "mspub",
     "teams": "teams",
-
     # --- Browsers ---
     "chrome": "chrome",
     "edge": "msedge",
     "firefox": "firefox",
     "opera": "opera",
     "brave": "brave",
-    "safari": "safari",  # if installed on Windows
-
     # --- Code Editors & Dev Tools ---
     "vscode": "code",
     "visual studio": "devenv",
@@ -93,7 +78,6 @@ openapp = {
     "xamp": "xampp-control",
     "docker": "docker",
     "postman": "postman",
-
     # --- Media Players ---
     "vlc": "vlc",
     "windows media player": "wmplayer",
@@ -102,7 +86,6 @@ openapp = {
     "spotify": "spotify",
     "itunes": "itunes",
     "audacity": "audacity",
-
     # --- Communication ---
     "skype": "skype",
     "zoom": "zoom",
@@ -113,14 +96,12 @@ openapp = {
     "signal": "signal",
     "google meet": "chrome --app=https://meet.google.com",
     "outlook mail": "outlookmail:",
-
     # --- Cloud & Storage ---
     "onedrive": "onedrive",
     "google drive": "googledrive",
     "dropbox": "dropbox",
     "mega": "mega",
     "icloud": "icloud",
-
     # --- Design & Creative ---
     "photoshop": "photoshop",
     "illustrator": "illustrator",
@@ -130,7 +111,6 @@ openapp = {
     "coreldraw": "coreldraw",
     "canva": "canva",
     "paint 3d": "ms-paint:",
-
     # --- Utilities ---
     "7zip": "7zfm",
     "winrar": "winrar",
@@ -140,7 +120,6 @@ openapp = {
     "anydesk": "anydesk",
     "obs studio": "obs64",
     "screen recorder": "ms-screenclip:",
-
     # --- Gaming & Stores ---
     "steam": "steam",
     "epic games": "epicgameslauncher",
@@ -152,15 +131,15 @@ openapp = {
     "fortnite": "fortnite",
     "pubg": "pubg",
     "gta": "gta5"
-
 }
 
-def openappweb(query):
+
+def openappweb(query, speak=None):
+    if speak is None:
+        speak = print
     speak("Launching...")
     if ".com" in query or ".co.in" in query or ".org" in query:
-        query = query.replace("open", "")
-        query = query.replace("launch", "")
-        query = query.replace(" ", "")
+        query = query.replace("open", "").replace("launch", "").replace(" ", "")
         webbrowser.open(f"https://www.{query}")
     else:
         for app in openapp:
@@ -169,7 +148,10 @@ def openappweb(query):
                 return
         speak("Application not found.")
 
-def closeappweb(query):
+
+def closeappweb(query, speak=None):
+    if speak is None:
+        speak = print
     speak("Closing...")
     tab_count = 0
 
@@ -198,7 +180,3 @@ def closeappweb(query):
             return
 
     speak("Application not found to close.")
-        
-
-
-

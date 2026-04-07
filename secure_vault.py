@@ -1,592 +1,588 @@
 import os
-import cv2
-import bcrypt
-import json
-import shutil
-import tkinter as tk
-from tkinter import (
-    Tk, Button, Label, Frame, Listbox, Scrollbar,
-    END, RIGHT, LEFT, Y, BOTH, messagebox, filedialog,
-    simpledialog, scrolledtext
-)
-import pyautogui
-import datetime
-import subprocess
 import sys
+import json
+import uuid
 import time
+import datetime
+import tempfile
+import subprocess
 import base64
-import pickle
-from PIL import Image
 import io
 import hashlib
-from cryptography.fernet import Fernet
-import secrets
-import string
-import tempfile
 
-# === TRULY SECURE VAULT STORAGE ===
+import cv2
+import pyautogui
+from PIL import Image
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+
+
+# ══════════════════════════════════════════════════════════════
+#  AES-256-GCM ENCRYPTION ENGINE  (AWS-Standard Algorithm)
+# ══════════════════════════════════════════════════════════════
+
+class AES256GCMEngine:
+    """
+    AWS-standard AES-256-GCM encryption engine.
+    Uses PBKDF2-HMAC-SHA256 for key derivation with 600,000 iterations.
+    Each encryption generates a unique 12-byte nonce for GCM.
+    """
+    SALT_SIZE = 16          # 128-bit salt
+    NONCE_SIZE = 12         # 96-bit nonce (GCM standard)
+    KEY_SIZE = 32           # 256-bit key
+    ITERATIONS = 600_000    # OWASP 2023 recommendation for PBKDF2-SHA256
+
+    @staticmethod
+    def derive_key(password: str, salt: bytes) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=AES256GCMEngine.KEY_SIZE,
+            salt=salt,
+            iterations=AES256GCMEngine.ITERATIONS,
+        )
+        return kdf.derive(password.encode('utf-8'))
+
+    @staticmethod
+    def encrypt(plaintext: bytes, key: bytes) -> bytes:
+        nonce = os.urandom(AES256GCMEngine.NONCE_SIZE)
+        aesgcm = AESGCM(key)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+        return nonce + ciphertext
+
+    @staticmethod
+    def decrypt(data: bytes, key: bytes) -> bytes:
+        nonce = data[:AES256GCMEngine.NONCE_SIZE]
+        ciphertext = data[AES256GCMEngine.NONCE_SIZE:]
+        aesgcm = AESGCM(key)
+        return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SECURE VAULT STORAGE
+# ══════════════════════════════════════════════════════════════
+
 class SecureVaultStorage:
+    """Encrypted file vault with AES-256-GCM. Files stored inside the app directory."""
+
+    VERIFY_TOKEN = b"VALTRIX_VAULT_AES256GCM_VALID"
+
     def __init__(self):
-        self.vault_data = {}
-        self.config_data = {}
-        self.intruder_logs = []
-        self.encryption_key = None
-        self.vault_dir = self.get_vault_directory()
-        self.vault_file = os.path.join(self.vault_dir, "secure_vault.enc")
-        self.key_file = os.path.join(self.vault_dir, ".vault_key")
-        self.setup_encryption()
-        self.load_existing_data()
-    
-    def get_vault_directory(self):
-        """Get vault directory inside app folder"""
-        # Get directory where this script is located
+        self.vault_dir = self._get_vault_directory()
+        self.files_dir = os.path.join(self.vault_dir, "files")
+        self.intruder_dir = os.path.join(self.vault_dir, "intruders")
+        self.salt_file = os.path.join(self.vault_dir, "vault.salt")
+        self.verify_file = os.path.join(self.vault_dir, "vault.verify")
+        self.meta_file = os.path.join(self.vault_dir, "vault_meta.enc")
+        self.intruder_log_file = os.path.join(self.vault_dir, "intruder_logs.json")
+
+        os.makedirs(self.files_dir, exist_ok=True)
+        os.makedirs(self.intruder_dir, exist_ok=True)
+
+        self._session_key = None
+        self._metadata = {"files": {}}
+
+    def _get_vault_directory(self):
         if getattr(sys, 'frozen', False):
-            # If running as compiled exe
             app_dir = os.path.dirname(sys.executable)
         else:
-            # If running as script
             app_dir = os.path.dirname(os.path.abspath(__file__))
-        
         vault_dir = os.path.join(app_dir, "secure_vault")
         os.makedirs(vault_dir, exist_ok=True)
-        
-        # Set hidden attribute on Windows
         if os.name == 'nt':
             try:
                 import ctypes
-                ctypes.windll.kernel32.SetFileAttributesW(vault_dir, 0x02)  # FILE_ATTRIBUTE_HIDDEN
-            except:
+                ctypes.windll.kernel32.SetFileAttributesW(vault_dir, 0x02)
+            except Exception:
                 pass
         return vault_dir
-    
-    def setup_encryption(self):
-        """Setup encryption key - stored securely in app directory"""
-        if os.path.exists(self.key_file):
-            # Load existing key
+
+    def is_setup(self) -> bool:
+        return os.path.exists(self.salt_file) and os.path.exists(self.verify_file)
+
+    def is_unlocked(self) -> bool:
+        return self._session_key is not None
+
+    # ── Setup & Auth ──────────────────────────────────────
+
+    def setup(self, password: str) -> bool:
+        try:
+            salt = os.urandom(AES256GCMEngine.SALT_SIZE)
+            key = AES256GCMEngine.derive_key(password, salt)
+            with open(self.salt_file, 'wb') as f:
+                f.write(salt)
+            encrypted_verify = AES256GCMEngine.encrypt(self.VERIFY_TOKEN, key)
+            with open(self.verify_file, 'wb') as f:
+                f.write(encrypted_verify)
+            self._session_key = key
+            self._metadata = {"files": {}}
+            self._save_metadata()
+            self._hide_file(self.salt_file)
+            self._hide_file(self.verify_file)
+            return True
+        except Exception as e:
+            print(f"Vault setup error: {e}")
+            return False
+
+    def unlock(self, password: str) -> bool:
+        try:
+            with open(self.salt_file, 'rb') as f:
+                salt = f.read()
+            key = AES256GCMEngine.derive_key(password, salt)
+            with open(self.verify_file, 'rb') as f:
+                encrypted_verify = f.read()
+            plaintext = AES256GCMEngine.decrypt(encrypted_verify, key)
+            if plaintext == self.VERIFY_TOKEN:
+                self._session_key = key
+                self._load_metadata()
+                return True
+            return False
+        except Exception:
+            return False
+
+    def lock(self):
+        self._session_key = None
+        self._metadata = {"files": {}}
+
+    # ── File Operations ───────────────────────────────────
+
+    def upload_file(self, filepath: str) -> bool:
+        if not self._session_key:
+            return False
+        try:
+            with open(filepath, 'rb') as f:
+                file_data = f.read()
+            file_id = str(uuid.uuid4())
+            encrypted = AES256GCMEngine.encrypt(file_data, self._session_key)
+            enc_path = os.path.join(self.files_dir, f"{file_id}.enc")
+            with open(enc_path, 'wb') as f:
+                f.write(encrypted)
+            self._metadata["files"][file_id] = {
+                "name": os.path.basename(filepath),
+                "size": len(file_data),
+                "uploaded": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+            self._save_metadata()
+            return True
+        except Exception as e:
+            print(f"Upload error: {e}")
+            return False
+
+    def download_file(self, file_id: str, dest_dir: str):
+        if not self._session_key:
+            return None
+        try:
+            enc_path = os.path.join(self.files_dir, f"{file_id}.enc")
+            with open(enc_path, 'rb') as f:
+                encrypted = f.read()
+            file_data = AES256GCMEngine.decrypt(encrypted, self._session_key)
+            filename = self._metadata["files"][file_id]["name"]
+            dest_path = os.path.join(dest_dir, filename)
+            with open(dest_path, 'wb') as f:
+                f.write(file_data)
+            return dest_path
+        except Exception as e:
+            print(f"Download error: {e}")
+            return None
+
+    def open_file_temp(self, file_id: str):
+        if not self._session_key:
+            return None
+        try:
+            enc_path = os.path.join(self.files_dir, f"{file_id}.enc")
+            with open(enc_path, 'rb') as f:
+                encrypted = f.read()
+            file_data = AES256GCMEngine.decrypt(encrypted, self._session_key)
+            filename = self._metadata["files"][file_id]["name"]
+            temp_path = os.path.join(tempfile.gettempdir(), filename)
+            with open(temp_path, 'wb') as f:
+                f.write(file_data)
+            if sys.platform.startswith('win'):
+                os.startfile(temp_path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', temp_path])
+            else:
+                subprocess.Popen(['xdg-open', temp_path])
+            return temp_path
+        except Exception as e:
+            print(f"Open error: {e}")
+            return None
+
+    def delete_file(self, file_id: str) -> bool:
+        if not self._session_key:
+            return False
+        try:
+            enc_path = os.path.join(self.files_dir, f"{file_id}.enc")
+            if os.path.exists(enc_path):
+                os.remove(enc_path)
+            if file_id in self._metadata["files"]:
+                del self._metadata["files"][file_id]
+            self._save_metadata()
+            return True
+        except Exception as e:
+            print(f"Delete error: {e}")
+            return False
+
+    def list_files(self) -> dict:
+        return self._metadata.get("files", {})
+
+    # ── Metadata ──────────────────────────────────────────
+
+    def _save_metadata(self):
+        if not self._session_key:
+            return
+        meta_json = json.dumps(self._metadata).encode('utf-8')
+        encrypted = AES256GCMEngine.encrypt(meta_json, self._session_key)
+        with open(self.meta_file, 'wb') as f:
+            f.write(encrypted)
+
+    def _load_metadata(self):
+        if not self._session_key or not os.path.exists(self.meta_file):
+            self._metadata = {"files": {}}
+            return
+        try:
+            with open(self.meta_file, 'rb') as f:
+                encrypted = f.read()
+            meta_json = AES256GCMEngine.decrypt(encrypted, self._session_key)
+            self._metadata = json.loads(meta_json.decode('utf-8'))
+        except Exception:
+            self._metadata = {"files": {}}
+
+    # ── Intruder Detection ────────────────────────────────
+
+    def log_intruder(self, speak_func=None):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        entry = {"timestamp": timestamp, "camera": False, "screenshot": False}
+
+        cam = None
+        try:
+            cam = cv2.VideoCapture(0)
+            if cam.isOpened():
+                time.sleep(2)
+                ret, frame = cam.read()
+                if ret and frame is not None:
+                    photo_path = os.path.join(self.intruder_dir, f"cam_{timestamp}.jpg")
+                    cv2.imwrite(photo_path, frame)
+                    entry["camera"] = True
+                    entry["photo"] = photo_path
+        except Exception as e:
+            print(f"Camera error: {e}")
+        finally:
+            if cam:
+                cam.release()
+
+        try:
+            ss = pyautogui.screenshot()
+            ss_path = os.path.join(self.intruder_dir, f"ss_{timestamp}.png")
+            ss.save(ss_path)
+            entry["screenshot"] = True
+            entry["screenshot_path"] = ss_path
+        except Exception as e:
+            print(f"Screenshot error: {e}")
+
+        logs = self.get_intruder_logs()
+        logs.append(entry)
+        with open(self.intruder_log_file, 'w') as f:
+            json.dump(logs, f, indent=2)
+
+        if speak_func:
+            speak_func("Unauthorized access attempt recorded.")
+
+    def get_intruder_logs(self) -> list:
+        if os.path.exists(self.intruder_log_file):
             try:
-                with open(self.key_file, 'rb') as f:
-                    encrypted_key = f.read()
-                
-                # Derive key from master password (if set)
-                if "password" in self.config_data:
-                    master_key = self.derive_key_from_password(self.config_data["password"])
-                    fernet = Fernet(master_key)
-                    self.encryption_key = fernet.decrypt(encrypted_key)
-                else:
-                    # First time setup - use device-specific key
-                    device_key = self.generate_device_key()
-                    fernet = Fernet(device_key)
-                    self.encryption_key = fernet.decrypt(encrypted_key)
-                    
-            except Exception as e:
-                print(f"Key loading error: {e}")
-                self.generate_new_keys()
-        else:
-            self.generate_new_keys()
-    
-    def generate_new_keys(self):
-        """Generate new encryption keys"""
-        # Generate random encryption key
-        self.encryption_key = Fernet.generate_key()
-        
-        # Generate device-specific key for protecting the encryption key
-        device_key = self.generate_device_key()
-        
-        # Encrypt the main key with device key
-        fernet = Fernet(device_key)
-        encrypted_main_key = fernet.encrypt(self.encryption_key)
-        
-        # Save encrypted main key
-        with open(self.key_file, 'wb') as f:
-            f.write(encrypted_main_key)
-        
-        # Set hidden attribute on Windows
+                with open(self.intruder_log_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return []
+
+    # ── Helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _hide_file(path):
         if os.name == 'nt':
             try:
                 import ctypes
-                ctypes.windll.kernel32.SetFileAttributesW(self.key_file, 0x02)  # FILE_ATTRIBUTE_HIDDEN
-            except:
+                ctypes.windll.kernel32.SetFileAttributesW(path, 0x02)
+            except Exception:
                 pass
-    
-    def generate_device_key(self):
-        """Generate device-specific key based on system properties"""
-        import platform
-        system_info = f"{platform.node()}{platform.processor()}{os.name}"
-        return base64.urlsafe_b64encode(hashlib.sha256(system_info.encode()).digest())
-    
-    def derive_key_from_password(self, password_hash):
-        """Derive encryption key from password"""
-        return base64.urlsafe_b64encode(hashlib.sha256(password_hash.encode()).digest())
-    
-    def encrypt_data(self, data):
-        """Encrypt data using Fernet encryption"""
-        fernet = Fernet(self.encryption_key)
-        encrypted_data = fernet.encrypt(pickle.dumps(data))
-        return encrypted_data
-    
-    def decrypt_data(self, encrypted_data):
-        """Decrypt data using Fernet encryption"""
-        try:
-            fernet = Fernet(self.encryption_key)
-            decrypted_data = pickle.loads(fernet.decrypt(encrypted_data))
-            return decrypted_data
-        except Exception as e:
-            print(f"Decryption error: {e}")
-            return None
-    
-    def load_existing_data(self):
-        """Load encrypted vault data from app directory"""
-        try:
-            if os.path.exists(self.vault_file):
-                with open(self.vault_file, 'rb') as f:
-                    encrypted_data = f.read()
-                
-                decrypted_data = self.decrypt_data(encrypted_data)
-                if decrypted_data:
-                    self.vault_data = decrypted_data.get('vault_data', {})
-                    self.config_data = decrypted_data.get('config_data', {})
-                    self.intruder_logs = decrypted_data.get('intruder_logs', [])
-        except Exception as e:
-            print(f"Vault loading error: {e}")
-            # Start fresh if loading fails
-            self.vault_data = {}
-            self.config_data = {}
-            self.intruder_logs = []
-    
-    def save_to_disk(self):
-        """Save encrypted vault data to app directory"""
-        try:
-            data_to_save = {
-                'vault_data': self.vault_data,
-                'config_data': self.config_data,
-                'intruder_logs': self.intruder_logs
-            }
-            
-            encrypted_data = self.encrypt_data(data_to_save)
-            
-            with open(self.vault_file, 'wb') as f:
-                f.write(encrypted_data)
-            
-            # Set hidden attribute on Windows
-            if os.name == 'nt':
-                try:
-                    import ctypes
-                    ctypes.windll.kernel32.SetFileAttributesW(self.vault_file, 0x02)  # FILE_ATTRIBUTE_HIDDEN
-                except:
-                    pass
-                    
-        except Exception as e:
-            print(f"Failed to save vault: {e}")
 
-# Create global vault storage
+    @staticmethod
+    def format_size(size_bytes):
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 ** 2:
+            return f"{size_bytes / 1024:.1f} KB"
+        elif size_bytes < 1024 ** 3:
+            return f"{size_bytes / (1024 ** 2):.1f} MB"
+        return f"{size_bytes / (1024 ** 3):.2f} GB"
+
+
+# ══════════════════════════════════════════════════════════════
+#  GLOBAL VAULT INSTANCE
+# ══════════════════════════════════════════════════════════════
+
 vault_storage = SecureVaultStorage()
 
-def setup_vault(speak_func=None):
-    if speak_func:
-        speak_func("Setting up your secure vault for the first time.")
-    password = simpledialog.askstring("Vault Setup", "Create a strong password:", show='*')
-    if not password:
-        if speak_func:
-            speak_func("Password not set. Vault setup cancelled.")
-        return False
-    if len(password) < 4:
-        messagebox.showwarning("Weak Password", "Consider using a stronger password (at least 4 characters).")
-    
-    password_bytes = password.encode('utf-8')
-    hashed = bcrypt.hashpw(password_bytes, bcrypt.gensalt())
-    
-    vault_storage.config_data["password"] = hashed.decode('utf-8')
-    vault_storage.save_to_disk()
-    
-    if speak_func:
-        speak_func("Vault setup completed successfully!")
-    return True
 
-def log_intruder(speak_func=None):
-    """Log intruder attempts in memory"""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    
-    intruder_data = {
-        "timestamp": timestamp,
-        "camera_available": False,
-        "screenshot_taken": False,
-        "photo": None,
-        "screenshot": None
-    }
-    
-    # Try to take photo
-    cam = None
-    try:
-        cam = cv2.VideoCapture(0)
-        if cam.isOpened():
-            # Allow camera to initialize
-            time.sleep(2)
-            ret, frame = cam.read()
-            if ret and frame is not None:
-                # Convert image to base64 for in-memory storage
-                success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if success:
-                    img_base64 = base64.b64encode(buffer).decode('utf-8')
-                    intruder_data["photo"] = img_base64
-                    intruder_data["camera_available"] = True
-                    print("Camera photo captured successfully")
-    except Exception as e:
-        print(f"Camera error: {e}")
-    finally:
-        if cam:
-            cam.release()
-    
-    # Take screenshot
-    try:
-        screenshot = pyautogui.screenshot()
-        # Convert PIL Image to bytes
-        img_byte_arr = io.BytesIO()
-        screenshot.save(img_byte_arr, format='PNG')
-        img_byte_arr = img_byte_arr.getvalue()
-        
-        # Convert to base64
-        screenshot_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
-        intruder_data["screenshot"] = screenshot_base64
-        intruder_data["screenshot_taken"] = True
-        print("Screenshot captured successfully")
-    except Exception as e:
-        print(f"Screenshot error: {e}")
-    
-    # Add to intruder logs
-    vault_storage.intruder_logs.append(intruder_data)
-    vault_storage.save_to_disk()
-    
-    print(f"Intruder logged: Camera={intruder_data['camera_available']}, Screenshot={intruder_data['screenshot_taken']}")
-    if speak_func:
-        speak_func("Unauthorized access recorded and secured.")
+# ══════════════════════════════════════════════════════════════
+#  PASSWORD DIALOG (customtkinter)
+# ══════════════════════════════════════════════════════════════
 
-def open_with_default(file_path):
-    """Open a temporary file with default application"""
-    try:
-        if sys.platform.startswith('win'):
-            os.startfile(file_path)
-        elif sys.platform == 'darwin':
-            subprocess.Popen(['open', file_path])
-        else:
-            subprocess.Popen(['xdg-open', file_path])
-    except Exception as e:
-        messagebox.showerror("Open Error", f"Could not open: {e}")
+def _ask_password(title="Vault Access", prompt="Enter your vault password:"):
+    import customtkinter as ctk
+    dialog = ctk.CTkToplevel()
+    dialog.title(title)
+    dialog.geometry("420x220")
+    dialog.configure(fg_color="#0b0f19")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.attributes("-topmost", True)
+    result = [None]
 
-def save_intruder_media(intruder_log, temp_dir):
-    """Save intruder photos and screenshots to temporary files for viewing"""
-    saved_files = []
-    
-    try:
-        # Save photo if available
-        if intruder_log.get('photo') and intruder_log.get('camera_available'):
-            photo_data = base64.b64decode(intruder_log['photo'])
-            photo_path = os.path.join(temp_dir, f"photo_{intruder_log['timestamp']}.jpg")
-            with open(photo_path, 'wb') as f:
-                f.write(photo_data)
-            saved_files.append(("Camera Photo", photo_path))
-        
-        # Save screenshot if available
-        if intruder_log.get('screenshot') and intruder_log.get('screenshot_taken'):
-            screenshot_data = base64.b64decode(intruder_log['screenshot'])
-            screenshot_path = os.path.join(temp_dir, f"screenshot_{intruder_log['timestamp']}.png")
-            with open(screenshot_path, 'wb') as f:
-                f.write(screenshot_data)
-            saved_files.append(("Screenshot", screenshot_path))
-            
-    except Exception as e:
-        print(f"Error saving intruder media: {e}")
-    
-    return saved_files
+    ctk.CTkLabel(dialog, text=prompt, font=("Arial", 14, "bold"),
+                 text_color="#e2e8f0").pack(pady=(25, 10))
 
-# === Vault GUI ===
+    entry = ctk.CTkEntry(dialog, show="•", width=280, height=40,
+                         font=("Arial", 14), fg_color="#111827",
+                         border_color="#3b82f6", text_color="#e2e8f0")
+    entry.pack(pady=10)
+    entry.focus_set()
+
+    def submit():
+        result[0] = entry.get()
+        dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    bf = ctk.CTkFrame(dialog, fg_color="transparent")
+    bf.pack(pady=15)
+    ctk.CTkButton(bf, text="Unlock", command=submit, fg_color="#3b82f6",
+                  hover_color="#2563eb", width=110, height=36,
+                  font=("Arial", 12, "bold")).pack(side="left", padx=8)
+    ctk.CTkButton(bf, text="Cancel", command=cancel, fg_color="#ef4444",
+                  hover_color="#dc2626", width=110, height=36,
+                  font=("Arial", 12, "bold")).pack(side="left", padx=8)
+    entry.bind("<Return>", lambda e: submit())
+    dialog.wait_window()
+    return result[0]
+
+
+# ══════════════════════════════════════════════════════════════
+#  VAULT GUI
+# ══════════════════════════════════════════════════════════════
+
 def open_vault_gui():
-    vault_win = Tk()
-    vault_win.title("🔒 Secure Vault - Encrypted Storage")
-    vault_win.geometry("800x520")
-    vault_win.configure(bg="#0d1b2a")
+    import customtkinter as ctk
+    from tkinter import filedialog, messagebox
+    import tkinter as tk
 
-    current_path = ["/"]  # Virtual path in memory storage
+    BG = "#0b0f19"
+    CARD = "#111827"
+    BORDER = "#1e293b"
+    TEXT = "#e2e8f0"
+    DIM = "#64748b"
+    ACCENT = "#3b82f6"
 
-    Label(vault_win, text="Your Secure Vault (Encrypted Storage)", bg="#0d1b2a", fg="#e0e1dd", font=("Arial", 16, "bold")).pack(pady=8)
+    vault_win = ctk.CTkToplevel()
+    vault_win.title("🔒 Valtrix AI — Secure Vault (AES-256-GCM)")
+    vault_win.geometry("900x580")
+    vault_win.configure(fg_color=BG)
+    vault_win.attributes("-topmost", True)
+    vault_win.after(100, lambda: vault_win.attributes("-topmost", False))
 
-    frame = Frame(vault_win, bg="#0d1b2a")
-    frame.pack(fill=BOTH, expand=True, padx=10, pady=4)
+    # Header
+    header = ctk.CTkFrame(vault_win, fg_color="transparent", height=50)
+    header.pack(fill="x", padx=20, pady=(15, 5))
+    header.pack_propagate(False)
+    ctk.CTkLabel(header, text="🔒  Secure Vault", font=("Arial", 20, "bold"),
+                 text_color=TEXT).pack(side="left")
+    ctk.CTkLabel(header, text="AES-256-GCM Encrypted Storage",
+                 font=("Arial", 11), text_color=DIM).pack(side="left", padx=(12, 0), pady=(4, 0))
 
-    scrollbar = Scrollbar(frame, bg="#415a77")
-    scrollbar.pack(side=RIGHT, fill=Y)
+    # File list
+    list_frame = ctk.CTkFrame(vault_win, fg_color=CARD, corner_radius=15,
+                              border_width=1, border_color=BORDER)
+    list_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
-    listbox = Listbox(frame, selectmode="extended", yscrollcommand=scrollbar.set, bg="#1b263b", fg="#e0e1dd",
-                      font=("Arial", 11), highlightbackground="#415a77", selectbackground="#778da9")
-    listbox.pack(side=LEFT, fill=BOTH, expand=True)
-    scrollbar.config(command=listbox.yview)
+    cols_header = ctk.CTkFrame(list_frame, fg_color="#0d1117", corner_radius=0, height=35)
+    cols_header.pack(fill="x", padx=2, pady=(2, 0))
+    cols_header.pack_propagate(False)
+    ctk.CTkLabel(cols_header, text="    Filename", font=("Arial", 10, "bold"),
+                 text_color=DIM, anchor="w").pack(side="left", padx=15)
+    ctk.CTkLabel(cols_header, text="Size", font=("Arial", 10, "bold"),
+                 text_color=DIM).pack(side="right", padx=(0, 140))
+    ctk.CTkLabel(cols_header, text="Uploaded", font=("Arial", 10, "bold"),
+                 text_color=DIM).pack(side="right", padx=(0, 30))
 
-    def get_current_files():
-        """Get files from current virtual path"""
-        if current_path[0] == "/":
-            return list(vault_storage.vault_data.keys())
-        return []
+    listbox = tk.Listbox(list_frame, bg="#0d1117", fg=TEXT, font=("Consolas", 11),
+                         selectbackground=ACCENT, selectforeground="white",
+                         highlightthickness=0, bd=0, relief="flat",
+                         selectmode="extended", activestyle="none")
+    scrollbar = ctk.CTkScrollbar(list_frame, command=listbox.yview)
+    listbox.configure(yscrollcommand=scrollbar.set)
+    listbox.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+    scrollbar.pack(side="right", fill="y", padx=(0, 5), pady=(0, 10))
+
+    file_id_map = {}
 
     def refresh_list():
-        listbox.delete(0, END)
-        try:
-            items = get_current_files()
-            for item in items:
-                listbox.insert(END, item)
-            
-            # Always show intruder logs option
-            listbox.insert(END, "[Intruder Logs]")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not read vault: {e}")
+        listbox.delete(0, tk.END)
+        file_id_map.clear()
+        files = vault_storage.list_files()
+        for idx, (fid, meta) in enumerate(files.items()):
+            size_str = vault_storage.format_size(meta.get("size", 0))
+            date_str = meta.get("uploaded", "")
+            display = f"  {meta['name']:<40s}  {size_str:<12s}  {date_str}"
+            listbox.insert(tk.END, display)
+            file_id_map[idx] = fid
 
     def upload_files():
-        files = filedialog.askopenfilenames(title="Select Files to Upload")
-        for file_path in files:
-            try:
-                with open(file_path, 'rb') as f:
-                    file_content = f.read()
-                    file_b64 = base64.b64encode(file_content).decode('utf-8')
-                    
-                filename = os.path.basename(file_path)
-                vault_storage.vault_data[filename] = {
-                    "content": file_b64,
-                    "upload_time": datetime.datetime.now().isoformat(),
-                    "size": len(file_content)
-                }
-            except Exception as e:
-                messagebox.showerror("Upload Error", f"Could not upload {file_path}: {e}")
-        
-        vault_storage.save_to_disk()
-        messagebox.showinfo("Success", "Files uploaded to secure vault.")
+        paths = filedialog.askopenfilenames(title="Select Files to Upload to Vault")
+        if not paths:
+            return
+        count = 0
+        for p in paths:
+            if vault_storage.upload_file(p):
+                count += 1
+        messagebox.showinfo("Upload Complete", f"{count} file(s) encrypted and stored.")
         refresh_list()
 
     def download_selected():
-        selections = listbox.curselection()
-        if not selections:
-            messagebox.showwarning("No selection", "Select files to download.")
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select files to download.")
             return
-
-        dst_dir = filedialog.askdirectory(title="Select Download Location")
-        if not dst_dir:
+        dest = filedialog.askdirectory(title="Select Download Location")
+        if not dest:
             return
-
-        for i in selections:
-            name = listbox.get(i)
-            if name == "[Intruder Logs]":
-                messagebox.showinfo("Info", "Use 'View Intruder Logs' to access intruder data.")
-                continue
-            
-            if name in vault_storage.vault_data:
-                try:
-                    file_data = vault_storage.vault_data[name]
-                    file_content = base64.b64decode(file_data["content"])
-                    
-                    dest_path = os.path.join(dst_dir, name)
-                    with open(dest_path, 'wb') as f:
-                        f.write(file_content)
-                except Exception as e:
-                    messagebox.showerror("Download Error", f"Could not download {name}: {e}")
-        
-        messagebox.showinfo("Downloaded", f"Files saved to:\n{dst_dir}")
-
-    def delete_selected():
-        selections = listbox.curselection()
-        if not selections:
-            messagebox.showwarning("No selection", "Select files to delete.")
-            return
-
-        confirm = messagebox.askyesno("Delete", "Are you sure you want to delete selected items?")
-        if not confirm:
-            return
-
-        for i in selections:
-            name = listbox.get(i)
-            if name == "[Intruder Logs]":
-                messagebox.showwarning("Restricted", "You cannot delete intruder logs.")
-                continue
-            
-            if name in vault_storage.vault_data:
-                del vault_storage.vault_data[name]
-        
-        vault_storage.save_to_disk()
-        messagebox.showinfo("Success", "Items deleted from vault.")
-        refresh_list()
+        for i in sel:
+            fid = file_id_map.get(i)
+            if fid:
+                vault_storage.download_file(fid, dest)
+        messagebox.showinfo("Downloaded", f"Files decrypted and saved to:\n{dest}")
 
     def open_selected():
-        selections = listbox.curselection()
-        if not selections:
-            messagebox.showwarning("No selection", "Select a file to open.")
+        sel = listbox.curselection()
+        if not sel or len(sel) != 1:
+            messagebox.showwarning("Selection", "Select exactly one file to open.")
             return
+        fid = file_id_map.get(sel[0])
+        if fid:
+            vault_storage.open_file_temp(fid)
 
-        if len(selections) > 1:
-            messagebox.showinfo("Info", "Only one item can be opened at a time.")
+    def delete_selected():
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select files to delete.")
             return
-
-        name = listbox.get(selections[0])
-        if name == "[Intruder Logs]":
-            view_intruder_logs()
+        if not messagebox.askyesno("Confirm Delete", "Permanently delete selected files?"):
             return
-
-        if name in vault_storage.vault_data:
-            try:
-                # Create temporary file
-                temp_dir = tempfile.gettempdir()
-                temp_file = os.path.join(temp_dir, name)
-                
-                file_data = vault_storage.vault_data[name]
-                file_content = base64.b64decode(file_data["content"])
-                
-                with open(temp_file, 'wb') as f:
-                    f.write(file_content)
-                
-                open_with_default(temp_file)
-                
-                # Schedule cleanup of temp file
-                def cleanup_temp():
-                    try:
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                    except:
-                        pass
-                
-                vault_win.after(5000, cleanup_temp)  # Clean up after 5 seconds
-                
-            except Exception as e:
-                messagebox.showerror("Open Error", f"Could not open {name}: {e}")
+        for i in sorted(sel, reverse=True):
+            fid = file_id_map.get(i)
+            if fid:
+                vault_storage.delete_file(fid)
+        messagebox.showinfo("Deleted", "Files removed from vault.")
+        refresh_list()
 
     def view_intruder_logs():
-        if not vault_storage.intruder_logs:
-            messagebox.showinfo("No logs", "No intruder logs found.")
+        logs = vault_storage.get_intruder_logs()
+        if not logs:
+            messagebox.showinfo("Intruder Logs", "No intrusion attempts recorded.")
             return
-        
-        logs_win = Tk()
-        logs_win.title("Intruder Logs - Photos & Screenshots")
-        logs_win.geometry("800x600")
-        logs_win.configure(bg="#0d1b2a")
-        
-        # Create main frame
-        main_frame = Frame(logs_win, bg="#0d1b2a")
-        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        # Title
-        Label(main_frame, text="🚨 Intruder Detection Logs", bg="#0d1b2a", fg="#e63946", 
-              font=("Arial", 16, "bold")).pack(pady=10)
-        
-        # Create notebook for tabs
-        from tkinter import ttk
-        notebook = ttk.Notebook(main_frame)
-        notebook.pack(fill=BOTH, expand=True)
-        
-        # Create a tab for each intruder attempt
-        for i, log in enumerate(vault_storage.intruder_logs):
-            tab = Frame(notebook, bg="#0d1b2a")
-            notebook.add(tab, text=f"Attempt {i+1}")
-            
-            # Create scrollable frame for tab content
-            canvas = tk.Canvas(tab, bg="#0d1b2a")
-            scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-            scrollable_frame = ttk.Frame(canvas)
-            
-            scrollable_frame.bind(
-                "<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-            )
-            
-            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-            canvas.configure(yscrollcommand=scrollbar.set)
-            
-            # Log information
-            info_frame = Frame(scrollable_frame, bg="#1b263b", relief="raised", bd=1)
-            info_frame.pack(fill="x", padx=10, pady=10)
-            
-            Label(info_frame, text=f"Intruder Attempt {i+1}", bg="#1b263b", fg="#ffb703",
-                  font=("Arial", 12, "bold")).pack(pady=5)
-            
-            Label(info_frame, text=f"Timestamp: {log['timestamp']}", bg="#1b263b", fg="#e0e1dd",
-                  font=("Arial", 10)).pack(anchor="w", padx=10)
-            
-            Label(info_frame, text=f"Camera Used: {log.get('camera_available', False)}", bg="#1b263b", fg="#e0e1dd",
-                  font=("Arial", 10)).pack(anchor="w", padx=10)
-            
-            Label(info_frame, text=f"Screenshot Taken: {log.get('screenshot_taken', False)}", bg="#1b263b", fg="#e0e1dd",
-                  font=("Arial", 10)).pack(anchor="w", padx=10, pady=(0, 10))
-            
-            # Media display frame
-            media_frame = Frame(scrollable_frame, bg="#0d1b2a")
-            media_frame.pack(fill="x", padx=10, pady=10)
-            
-            # Create temporary directory for this session
-            temp_dir = tempfile.mkdtemp()
-            saved_files = save_intruder_media(log, temp_dir)
-            
-            if saved_files:
-                Label(media_frame, text="Captured Media:", bg="#0d1b2a", fg="#ffb703",
-                      font=("Arial", 11, "bold")).pack(anchor="w", pady=5)
-                
-                for media_type, file_path in saved_files:
-                    media_btn = Button(media_frame, text=f"📷 View {media_type}", 
-                                     command=lambda path=file_path: open_with_default(path),
-                                     bg="#415a77", fg="#e0e1dd", font=("Arial", 9),
-                                     relief="raised", width=20)
-                    media_btn.pack(anchor="w", pady=2)
-            else:
-                Label(media_frame, text="No media captured", bg="#0d1b2a", fg="#778da9",
-                      font=("Arial", 10)).pack(anchor="w", pady=5)
-            
-            # Pack canvas and scrollbar
-            canvas.pack(side="left", fill="both", expand=True)
-            scrollbar.pack(side="right", fill="y")
-            
-            # Cleanup function for temp files when window closes
-            def cleanup_temp_files():
-                try:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                except:
-                    pass
-            
-            logs_win.protocol("WM_DELETE_WINDOW", lambda: [cleanup_temp_files(), logs_win.destroy()])
-        
-        # If no logs with media
-        if not vault_storage.intruder_logs:
-            empty_tab = Frame(notebook, bg="#0d1b2a")
-            notebook.add(empty_tab, text="No Logs")
-            Label(empty_tab, text="No intruder logs available", bg="#0d1b2a", fg="#e0e1dd",
-                  font=("Arial", 12)).pack(expand=True)
+        log_win = ctk.CTkToplevel(vault_win)
+        log_win.title("🚨 Intruder Detection Logs")
+        log_win.geometry("700x500")
+        log_win.configure(fg_color=BG)
 
-    btn_frame = Frame(vault_win, bg="#0d1b2a")
-    btn_frame.pack(pady=5)
+        ctk.CTkLabel(log_win, text="🚨 Intruder Detection Logs",
+                     font=("Arial", 18, "bold"), text_color="#ef4444").pack(pady=15)
 
-    Button(btn_frame, text="Upload Files", command=upload_files, bg="#415a77", fg="#e0e1dd", 
-           width=12, font=("Arial", 9, "bold"), relief="raised").grid(row=0, column=0, padx=6, pady=3)
-    Button(btn_frame, text="Download", command=download_selected, bg="#778da9", fg="#0d1b2a", 
-           width=12, font=("Arial", 9, "bold"), relief="raised").grid(row=0, column=1, padx=6, pady=3)
-    Button(btn_frame, text="Delete", command=delete_selected, bg="#e63946", fg="#e0e1dd", 
-           width=12, font=("Arial", 9, "bold"), relief="raised").grid(row=0, column=2, padx=6, pady=3)
-    Button(btn_frame, text="Open", command=open_selected, bg="#ffb703", fg="#0d1b2a", 
-           width=12, font=("Arial", 9, "bold"), relief="raised").grid(row=0, column=3, padx=6, pady=3)
-    Button(btn_frame, text="View Intruder Logs", command=view_intruder_logs, bg="#343a40", fg="#e0e1dd", 
-           width=16, font=("Arial", 9, "bold"), relief="raised").grid(row=1, column=0, columnspan=2, pady=8)
+        scroll = ctk.CTkScrollableFrame(log_win, fg_color=BG)
+        scroll.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        for i, log in enumerate(logs):
+            card = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=12,
+                                border_width=1, border_color="#ef4444")
+            card.pack(fill="x", pady=5, padx=5)
+            ctk.CTkLabel(card, text=f"Attempt {i + 1}  —  {log['timestamp']}",
+                         font=("Arial", 12, "bold"), text_color="#f59e0b").pack(anchor="w", padx=15, pady=(10, 3))
+            ctk.CTkLabel(card, text=f"Camera: {'✅' if log.get('camera') else '❌'}   |   Screenshot: {'✅' if log.get('screenshot') else '❌'}",
+                         font=("Arial", 11), text_color=DIM).pack(anchor="w", padx=15, pady=(0, 8))
+
+            media_frame = ctk.CTkFrame(card, fg_color="transparent")
+            media_frame.pack(anchor="w", padx=15, pady=(0, 10))
+
+            if log.get("photo") and os.path.exists(log["photo"]):
+                ctk.CTkButton(media_frame, text="📷 View Photo", width=130,
+                              fg_color="#415a77", hover_color="#5a7aa7",
+                              command=lambda p=log["photo"]: os.startfile(p) if sys.platform.startswith("win") else None
+                              ).pack(side="left", padx=5)
+
+            if log.get("screenshot_path") and os.path.exists(log["screenshot_path"]):
+                ctk.CTkButton(media_frame, text="🖥️ View Screenshot", width=150,
+                              fg_color="#415a77", hover_color="#5a7aa7",
+                              command=lambda p=log["screenshot_path"]: os.startfile(p) if sys.platform.startswith("win") else None
+                              ).pack(side="left", padx=5)
+
+    # Buttons
+    btn_frame = ctk.CTkFrame(vault_win, fg_color="transparent", height=55)
+    btn_frame.pack(fill="x", padx=20, pady=(0, 15))
+    btn_frame.pack_propagate(False)
+
+    btn_inner = ctk.CTkFrame(btn_frame, fg_color="transparent")
+    btn_inner.pack(expand=True)
+
+    buttons = [
+        ("📤 Upload", upload_files, "#10b981", "#059669"),
+        ("📥 Download", download_selected, ACCENT, "#2563eb"),
+        ("📂 Open", open_selected, "#8b5cf6", "#7c3aed"),
+        ("🗑️ Delete", delete_selected, "#ef4444", "#dc2626"),
+        ("🚨 Intruder Logs", view_intruder_logs, "#f59e0b", "#d97706"),
+    ]
+    for text, cmd, fg, hover in buttons:
+        ctk.CTkButton(btn_inner, text=text, command=cmd, fg_color=fg,
+                      hover_color=hover, width=130, height=38, corner_radius=10,
+                      font=("Arial", 11, "bold"),
+                      text_color="white" if fg != "#f59e0b" else "#0a0e1a"
+                      ).pack(side="left", padx=5)
 
     refresh_list()
-    vault_win.mainloop()
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════
 
 def verify_password_and_open_vault(speak_func=None):
-    if "password" not in vault_storage.config_data:
-        if not setup_vault(speak_func):
+    if not vault_storage.is_setup():
+        pw = _ask_password("Vault Setup", "Create a vault password:")
+        if not pw:
+            if speak_func:
+                speak_func("Vault setup cancelled.")
             return
+        if len(pw) < 4:
+            from tkinter import messagebox
+            messagebox.showwarning("Weak Password", "Use at least 4 characters.")
+        if vault_storage.setup(pw):
+            if speak_func:
+                speak_func("Vault created with AES-256 encryption.")
+            open_vault_gui()
+        return
 
-    password = simpledialog.askstring("Vault Access", "Enter your vault password:", show='*')
-    if not password:
+    pw = _ask_password()
+    if not pw:
         if speak_func:
             speak_func("Password entry cancelled.")
         return
 
-    hashed_pw = vault_storage.config_data["password"].encode('utf-8')
-    if bcrypt.checkpw(password.encode('utf-8'), hashed_pw):
+    if vault_storage.unlock(pw):
         if speak_func:
-            speak_func("Password verified. Access granted. Opening vault.")
+            speak_func("Password verified. Vault unlocked.")
         open_vault_gui()
     else:
         if speak_func:
-            speak_func("Incorrect password. Access denied.")
-        log_intruder(speak_func)
+            speak_func("Incorrect password. Access denied. Intruder logged.")
+        vault_storage.log_intruder(speak_func)

@@ -1,8 +1,6 @@
 import os
 import sys
 import threading
-import tkinter as tk
-from tkinter import messagebox, simpledialog
 import speech_recognition as sr
 import pyttsx3
 import pyautogui
@@ -11,167 +9,169 @@ import psutil
 import platform
 from datetime import datetime
 
-# Import the separated modules
-from gui import create_gui
-from secure_vault import SecureVaultStorage, verify_password_and_open_vault
+from gui import create_gui, restart_with_theme
+from secure_vault import verify_password_and_open_vault
 
-# Global variables for GUI elements
-text_display = None
+# ══════════════════════════════════════════════════════
+#  VALTRIX AI — Main Entry Point
+# ══════════════════════════════════════════════════════
+
+# Global references
+chat_display = None
+waveform = None
+analytics = None
+root = None
 active = False
 
-# === Enhanced Text-to-Speech Setup ===
+# Shared TTS engine
 engine = pyttsx3.init("sapi5")
 voices = engine.getProperty("voices")
 if len(voices) > 1:
     engine.setProperty("voice", voices[1].id)
 engine.setProperty("rate", 170)
 
+
 def speak(text):
     try:
-        if text_display:
-            text_display.insert(tk.END, f"\nAssistant: {text}")
-            text_display.yview(tk.END)
+        if chat_display:
+            chat_display.add_message("valtrix", text)
     except Exception:
         pass
     try:
+        if waveform:
+            waveform.set_state("speaking")
         engine.say(text)
         engine.runAndWait()
     except Exception:
         pass
+    finally:
+        try:
+            if waveform:
+                waveform.set_state("idle")
+        except Exception:
+            pass
 
-# === Enhanced Voice Recognition with Noise Reduction ===
+
+# === Voice Recognition ===
 class EnhancedVoiceRecognizer:
     def __init__(self):
         self.recognizer = sr.Recognizer()
-        self.setup_recognizer()
-        
-    def setup_recognizer(self):
         self.recognizer.dynamic_energy_threshold = True
         self.recognizer.energy_threshold = 400
         self.recognizer.pause_threshold = 0.8
         self.recognizer.operation_timeout = 10
-        
-    def calibrate_microphone(self, source):
+
+    def calibrate(self, source):
         try:
             self.recognizer.adjust_for_ambient_noise(source, duration=2.0)
-            return True
-        except Exception as e:
-            print(f"Calibration warning: {e}")
-            return False
-    
-    def enhanced_listen(self, source):
+        except Exception:
+            pass
+
+    def listen(self, source):
         try:
-            audio = self.recognizer.listen(
-                source, 
-                timeout=6, 
-                phrase_time_limit=7
-            )
-            return audio
+            return self.recognizer.listen(source, timeout=6, phrase_time_limit=7)
         except sr.WaitTimeoutError:
             return None
-        except Exception as e:
-            print(f"Listening error: {e}")
+        except Exception:
             return None
 
-enhanced_recognizer = EnhancedVoiceRecognizer()
+
+recognizer = EnhancedVoiceRecognizer()
+
 
 def takeCommand():
-    r = enhanced_recognizer.recognizer
+    r = recognizer.recognizer
     try:
         with sr.Microphone() as source:
-            enhanced_recognizer.calibrate_microphone(source)
+            recognizer.calibrate(source)
             try:
-                if text_display:
-                    text_display.insert(tk.END, "\n🎤 Listening...")
-                    text_display.yview(tk.END)
+                if chat_display:
+                    chat_display.add_message("system", "🎤 Listening...")
+                if waveform:
+                    waveform.set_state("listening")
             except Exception:
                 pass
-            audio = enhanced_recognizer.enhanced_listen(source)
+            audio = recognizer.listen(source)
             if audio is None:
+                if waveform:
+                    waveform.set_state("idle")
                 speak("No speech detected.")
                 return "none"
-    except Exception as e:
+    except Exception:
+        if waveform:
+            waveform.set_state("idle")
         speak("Microphone not available.")
         return "none"
 
-    query = attempt_recognition(audio)
-    return query
+    if waveform:
+        waveform.set_state("idle")
+    return attempt_recognition(audio)
+
 
 def attempt_recognition(audio):
-    recognizer = enhanced_recognizer.recognizer
+    r = recognizer.recognizer
     try:
-        query = recognizer.recognize_google(audio, language='en-in')
-        query = query.lower().strip()
+        query = r.recognize_google(audio, language='en-in').lower().strip()
         if len(query.split()) < 1:
             speak("Please speak clearly.")
             return "none"
         try:
-            if text_display:
-                text_display.insert(tk.END, f"\nYou: {query}")
-                text_display.yview(tk.END)
+            if chat_display:
+                chat_display.add_message("you", query)
         except Exception:
             pass
         return query
     except sr.UnknownValueError:
-        try:
-            query = recognizer.recognize_google(
-                audio, 
-                language='en-in',
-                show_all=False
-            )
-            if query:
-                query = query.lower().strip()
-                try:
-                    if text_display:
-                        text_display.insert(tk.END, f"\nYou: {query}")
-                        text_display.yview(tk.END)
-                except Exception:
-                    pass
-                return query
-        except:
-            pass
-        speak("Sorry, I didn't get that clearly. Please try again.")
+        speak("Sorry, I didn't get that. Please try again.")
         return "none"
-    except sr.RequestError as e:
-        speak("Speech service is currently unavailable.")
+    except sr.RequestError:
+        speak("Speech service unavailable.")
         return "none"
 
-# === System Monitoring Functions ===
+
+# === System Monitoring ===
 def get_system_info():
     try:
-        cpu_percent = psutil.cpu_percent(interval=1)
-        memory = psutil.virtual_memory()
-        memory_total = round(memory.total / (1024**3), 2)
-        memory_used = round(memory.used / (1024**3), 2)
-        memory_percent = memory.percent
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
-        disk_total = round(disk.total / (1024**3), 2)
-        disk_used = round(disk.used / (1024**3), 2)
-        disk_percent = disk.percent
-        boot_time = datetime.fromtimestamp(psutil.boot_time())
-        uptime = datetime.now() - boot_time
-        uptime_str = str(uptime).split('.')[0]
-        
-        system_info = {
-            "cpu_usage": cpu_percent,
-            "memory_used": memory_used,
-            "memory_total": memory_total,
-            "memory_percent": memory_percent,
-            "disk_used": disk_used,
-            "disk_total": disk_total,
-            "disk_percent": disk_percent,
-            "uptime": uptime_str,
-            "boot_time": boot_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "os": f"{platform.system()} {platform.release()}",
-            "processor": platform.processor()
+        boot = datetime.fromtimestamp(psutil.boot_time())
+        uptime = str(datetime.now() - boot).split('.')[0]
+        return {
+            "cpu": cpu, "mem_used": round(mem.used / (1024**3), 2),
+            "mem_total": round(mem.total / (1024**3), 2), "mem_pct": mem.percent,
+            "disk_used": round(disk.used / (1024**3), 2),
+            "disk_total": round(disk.total / (1024**3), 2), "disk_pct": disk.percent,
+            "uptime": uptime, "os": f"{platform.system()} {platform.release()}",
         }
-        
-        return system_info
-    except Exception as e:
-        print(f"Error getting system info: {e}")
+    except Exception:
         return None
 
-# === Enhanced Core Assistant Loop ===
+
+def update_system_info(cpu_lbl, mem_lbl, disk_lbl, up_lbl, os_lbl,
+                       cpu_bar, mem_bar, disk_bar):
+    try:
+        info = get_system_info()
+        if info:
+            cpu_lbl.configure(text=f"{info['cpu']}%")
+            cpu_bar.set(info['cpu'] / 100)
+            mem_lbl.configure(text=f"{info['mem_used']}/{info['mem_total']}GB")
+            mem_bar.set(info['mem_pct'] / 100)
+            disk_lbl.configure(text=f"{info['disk_used']}/{info['disk_total']}GB")
+            disk_bar.set(info['disk_pct'] / 100)
+            up_lbl.configure(text=f"⏱ {info['uptime']}")
+            os_lbl.configure(text=info['os'])
+    except Exception:
+        pass
+    try:
+        if root and root.winfo_exists():
+            root.after(2000, lambda: update_system_info(
+                cpu_lbl, mem_lbl, disk_lbl, up_lbl, os_lbl, cpu_bar, mem_bar, disk_bar))
+    except Exception:
+        pass
+
+
+# === Assistant Loop ===
 def assistant_loop():
     global active
     active = True
@@ -179,135 +179,124 @@ def assistant_loop():
         from greeting import greetMe
         greetMe(speak)
     except Exception:
-        speak("Hello, I am your Desktop Assistant.")
+        speak("Hello, I am Valtrix AI.")
 
     while active:
         query = takeCommand()
         if query == "none":
             continue
-
         time.sleep(0.3)
 
         if "sleep mode" in query:
+            if analytics: analytics.track("sleep_mode")
             speak("Sleep mode activated")
             break
-
         elif "hello" in query:
+            if analytics: analytics.track("greeting")
             speak("Hello, how are you?")
         elif "fine" in query:
             speak("That's great!")
         elif "thank" in query:
+            if analytics: analytics.track("greeting")
             speak("It's my pleasure")
-
         elif "pause" in query:
+            if analytics: analytics.track("media_control")
             pyautogui.press("k")
             speak("Video paused")
         elif "play" in query:
+            if analytics: analytics.track("media_control")
             pyautogui.press("k")
             speak("Video played")
         elif "mute" in query:
+            if analytics: analytics.track("media_control")
             pyautogui.press("m")
             speak("Video muted")
         elif "volume up" in query:
+            if analytics: analytics.track("volume")
             try:
                 from keyboardfunction import volumeup
                 speak("Turning volume up")
                 volumeup()
             except Exception:
-                speak("Volume up function not available.")
+                speak("Volume up not available.")
         elif "volume down" in query:
+            if analytics: analytics.track("volume")
             try:
                 from keyboardfunction import volumedown
                 speak("Turning volume down")
                 volumedown()
             except Exception:
-                speak("Volume down function not available.")
+                speak("Volume down not available.")
         elif "open" in query:
+            if analytics: analytics.track("open_app")
             try:
                 from openapp import openappweb
-                openappweb(query)
+                openappweb(query, speak)
             except Exception:
                 speak("Unable to open app.")
         elif "close" in query:
+            if analytics: analytics.track("close_app")
             try:
                 from openapp import closeappweb
-                closeappweb(query)
+                closeappweb(query, speak)
             except Exception:
                 speak("Unable to close app.")
         elif "google" in query:
+            if analytics: analytics.track("google_search")
             try:
                 from SearchNow import searchGoogle
-                searchGoogle(query)
+                searchGoogle(query, speak)
             except Exception:
                 speak("Google search not working.")
         elif "youtube" in query:
+            if analytics: analytics.track("youtube_search")
             try:
                 from SearchNow import searchYoutube
-                searchYoutube(query)
+                searchYoutube(query, speak)
             except Exception:
                 speak("YouTube search not working.")
-        elif any(word in query for word in ["what", "when", "where", "who", "whom", "whose", "why", "how"]):
+        elif any(w in query for w in ["what", "when", "where", "who", "whom", "whose", "why", "how"]):
+            if analytics: analytics.track("wikipedia")
             try:
                 from SearchNow import searchWikipedia
-                searchWikipedia(query)
+                searchWikipedia(query, speak)
             except Exception:
                 speak("Wikipedia not working.")
-
         elif "deactivate" in query:
-            speak("Desktop Assistant is going offline")
-            os._exit(0)
+            if analytics: analytics.track("deactivate")
+            speak("Valtrix AI is going offline")
+            try:
+                if root:
+                    root.quit()
+            except Exception:
+                pass
+            break
+
 
 def start_thread():
-    thread = threading.Thread(target=assistant_loop)
-    thread.daemon = True
-    thread.start()
+    t = threading.Thread(target=assistant_loop)
+    t.daemon = True
+    t.start()
+
 
 def main():
-    global text_display
-    root, text_display = create_gui(
-        start_thread=start_thread,
-        open_vault=verify_password_and_open_vault,
-        update_system_info_func=update_system_info,
-        get_system_info_func=get_system_info
-    )
-    root.mainloop()
+    global chat_display, waveform, analytics, root
 
-def update_system_info(cpu_label, memory_label, disk_label, uptime_label, os_label, cpu_bar, memory_bar, disk_bar):
-    """Update system information display with safe element access"""
-    try:
-        info = get_system_info()
-        if not info:
-            return
-            
-        if cpu_label and cpu_bar:
-            cpu_label.config(text=f"CPU: {info['cpu_usage']}%")
-            cpu_bar['value'] = info['cpu_usage']
-        
-        if memory_label and memory_bar:
-            memory_label.config(text=f"RAM: {info['memory_used']}/{info['memory_total']}GB ({info['memory_percent']}%)")
-            memory_bar['value'] = info['memory_percent']
-        
-        if disk_label and disk_bar:
-            disk_label.config(text=f"Disk: {info['disk_used']}/{info['disk_total']}GB ({info['disk_percent']}%)")
-            disk_bar['value'] = info['disk_percent']
-        
-        if uptime_label:
-            uptime_label.config(text=f"Uptime: {info['uptime']}")
-        
-        if os_label:
-            os_label.config(text=f"OS: {info['os']}")
-        
-    except Exception as e:
-        if "uptime_label" in str(e) or "cpu_label" in str(e):
-            pass
-        else:
-            print(f"Error updating system info: {e}")
-    
-    try:
-        if root and root.winfo_exists():
-            root.after(2000, lambda: update_system_info(cpu_label, memory_label, disk_label, uptime_label, os_label, cpu_bar, memory_bar, disk_bar))
-    except:
-        pass
+    while True:
+        root, chat_display, waveform, analytics = create_gui(
+            start_thread=start_thread,
+            open_vault=lambda: verify_password_and_open_vault(speak),
+            update_system_info_func=update_system_info,
+            get_system_info_func=get_system_info
+        )
+        root.mainloop()
+
+        # If theme was changed, loop restarts the GUI
+        if restart_with_theme[0] is not None:
+            restart_with_theme[0] = None
+            continue
+        break
+
 
 if __name__ == "__main__":
     main()
